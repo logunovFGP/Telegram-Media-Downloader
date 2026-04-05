@@ -40,6 +40,9 @@
   const FORWARD_ICON = "\ue99a";
   const contentRangeRegex = /^bytes (\d+)-(\d+)\/(\d+)$/;
   const REFRESH_DELAY = 500;
+  const MAX_CONCURRENT_DOWNLOADS = 3;
+  const MAX_BLOB_SIZE = 2 * 1024 * 1024 * 1024; // 2GB limit for in-memory downloads
+  let _activeDownloads = 0;
   const hashCode = (s) => {
     var h = 0,
       l = s.length,
@@ -148,6 +151,12 @@
   };
 
   const tel_download_video = (url) => {
+    if (_activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
+      logger.error("Max concurrent downloads reached. Please wait for a download to finish.", null);
+      return;
+    }
+    _activeDownloads++;
+
     let _blobs = [];
     let _next_offset = 0;
     let _total_size = null;
@@ -159,8 +168,6 @@
       Date.now().toString();
     let fileName = hashCode(url).toString(36) + "." + _file_extension;
 
-    // Some video src is in format:
-    // 'stream/{"dcId":5,"location":{...},"size":...,"mimeType":"video/mp4","fileName":"xxxx.MP4"}'
     try {
       const metadata = JSON.parse(
         decodeURIComponent(url.split("/")[url.split("/").length - 1])
@@ -173,14 +180,17 @@
     }
     logger.info(`URL: ${url}`, fileName);
 
+    const cleanup = () => {
+      _activeDownloads--;
+      _blobs = [];
+    };
+
     const fetchNextPart = (_writable) => {
       fetch(url, {
         method: "GET",
         headers: {
           Range: `bytes=${_next_offset}-`,
         },
-        "User-Agent":
-          "User-Agent Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/117.0",
       })
         .then((res) => {
           if (![200, 206].includes(res.status)) {
@@ -194,27 +204,32 @@
           fileName =
             fileName.substring(0, fileName.indexOf(".") + 1) + _file_extension;
 
-          const match = res.headers
-            .get("Content-Range")
-            .match(contentRangeRegex);
+          const contentRange = res.headers.get("Content-Range");
+          if (contentRange) {
+            const match = contentRange.match(contentRangeRegex);
+            const startOffset = parseInt(match[1]);
+            const endOffset = parseInt(match[2]);
+            const totalSize = parseInt(match[3]);
 
-          const startOffset = parseInt(match[1]);
-          const endOffset = parseInt(match[2]);
-          const totalSize = parseInt(match[3]);
+            if (startOffset !== _next_offset) {
+              logger.error("Gap detected between responses.", fileName);
+              logger.info("Last offset: " + _next_offset, fileName);
+              logger.info("New start offset " + match[1], fileName);
+              throw new Error("Gap detected between responses.");
+            }
+            if (_total_size && totalSize !== _total_size) {
+              logger.error("Total size differs", fileName);
+              throw new Error("Total size differs");
+            }
 
-          if (startOffset !== _next_offset) {
-            logger.error("Gap detected between responses.", fileName);
-            logger.info("Last offset: " + _next_offset, fileName);
-            logger.info("New start offset " + match[1], fileName);
-            throw "Gap detected between responses.";
+            _next_offset = endOffset + 1;
+            _total_size = totalSize;
+          } else {
+            // Full content response (200) — single part
+            const contentLength = parseInt(res.headers.get("Content-Length"));
+            _total_size = contentLength;
+            _next_offset = contentLength;
           }
-          if (_total_size && totalSize !== _total_size) {
-            logger.error("Total size differs", fileName);
-            throw "Total size differs";
-          }
-
-          _next_offset = endOffset + 1;
-          _total_size = totalSize;
 
           logger.info(
             `Get response: ${res.headers.get(
@@ -235,8 +250,11 @@
         })
         .then((resBlob) => {
           if (_writable !== null) {
-            _writable.write(resBlob).then(() => {});
+            return _writable.write(resBlob);
           } else {
+            if (_next_offset > MAX_BLOB_SIZE) {
+              throw new Error("File too large for in-memory download (" + Math.round(_next_offset / 1024 / 1024) + "MB). Use a browser that supports File System Access API.");
+            }
             _blobs.push(resBlob);
           }
         })
@@ -256,11 +274,13 @@
               save();
             }
             completeProgress(videoId);
+            cleanup();
           }
         })
         .catch((reason) => {
           logger.error(reason, fileName);
           AbortProgress(videoId);
+          cleanup();
         });
     };
 
@@ -268,7 +288,7 @@
       logger.info("Finish downloading blobs", fileName);
       logger.info("Concatenating blobs and downloading...", fileName);
 
-      const blob = new Blob(_blobs, { type: "video/mp4" });
+      const blob = new Blob(_blobs, { type: "video/" + _file_extension });
       const blobUrl = window.URL.createObjectURL(blob);
 
       logger.info("Final blob size: " + blob.size + " bytes", fileName);
@@ -303,28 +323,60 @@
             .createWritable()
             .then((writable) => {
               fetchNextPart(writable);
-              createProgressBar(videoId);
+              createProgressBar(videoId, fileName);
             })
             .catch((err) => {
               console.error(err.name, err.message);
+              cleanup();
             });
         })
         .catch((err) => {
           if (err.name !== "AbortError") {
             console.error(err.name, err.message);
           }
+          cleanup();
         });
     } else {
       fetchNextPart(null);
-      createProgressBar(videoId);
+      createProgressBar(videoId, fileName);
     }
   };
 
   const tel_download_audio = (url) => {
+    if (_activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
+      logger.error("Max concurrent downloads reached. Please wait for a download to finish.", null);
+      return;
+    }
+    _activeDownloads++;
+
     let _blobs = [];
     let _next_offset = 0;
     let _total_size = null;
-    const fileName = hashCode(url).toString(36) + ".ogg";
+    let _mime_type = "audio/ogg";
+    let fileName = hashCode(url).toString(36) + ".ogg";
+
+    // Extract fileName from stream URL metadata
+    try {
+      const metadata = JSON.parse(
+        decodeURIComponent(url.split("/")[url.split("/").length - 1])
+      );
+      if (metadata.fileName) {
+        fileName = metadata.fileName;
+      }
+    } catch (e) {
+      // Invalid JSON string, pass extracting fileName
+    }
+    logger.info(`URL: ${url}`, fileName);
+
+    const audioId =
+      (Math.random() + 1).toString(36).substring(2, 10) +
+      "_" +
+      Date.now().toString();
+
+    const cleanup = () => {
+      _activeDownloads--;
+      _blobs = [];
+    };
 
     const fetchNextPart = (_writable) => {
       fetch(url, {
@@ -335,57 +387,70 @@
       })
         .then((res) => {
           if (res.status !== 206 && res.status !== 200) {
-            logger.error(
-              "Non 200/206 response was received: " + res.status,
-              fileName
+            throw new Error(
+              "Non 200/206 response was received: " + res.status
             );
-            return;
           }
 
           const mime = res.headers.get("Content-Type").split(";")[0];
           if (!mime.startsWith("audio/")) {
-            logger.error(
-              "Get non audio response with MIME type " + mime,
-              fileName
+            throw new Error(
+              "Get non audio response with MIME type " + mime
             );
-            throw "Get non audio response with MIME type " + mime;
           }
+          _mime_type = mime;
 
-          try {
-            const match = res.headers
-              .get("Content-Range")
-              .match(contentRangeRegex);
+          const contentRange = res.headers.get("Content-Range");
+          if (contentRange) {
+            const match = contentRange.match(contentRangeRegex);
 
             const startOffset = parseInt(match[1]);
             const endOffset = parseInt(match[2]);
             const totalSize = parseInt(match[3]);
 
             if (startOffset !== _next_offset) {
-              logger.error("Gap detected between responses.");
-              logger.info("Last offset: " + _next_offset);
-              logger.info("New start offset " + match[1]);
-              throw "Gap detected between responses.";
+              logger.error("Gap detected between responses.", fileName);
+              logger.info("Last offset: " + _next_offset, fileName);
+              logger.info("New start offset " + match[1], fileName);
+              throw new Error("Gap detected between responses.");
             }
             if (_total_size && totalSize !== _total_size) {
-              logger.error("Total size differs");
-              throw "Total size differs";
+              logger.error("Total size differs", fileName);
+              throw new Error("Total size differs");
             }
 
             _next_offset = endOffset + 1;
             _total_size = totalSize;
-          } finally {
-            logger.info(
-              `Get response: ${res.headers.get(
-                "Content-Length"
-              )} bytes data from ${res.headers.get("Content-Range")}`
-            );
-            return res.blob();
+          } else {
+            const contentLength = parseInt(res.headers.get("Content-Length"));
+            _total_size = contentLength;
+            _next_offset = contentLength;
           }
+
+          logger.info(
+            `Get response: ${res.headers.get(
+              "Content-Length"
+            )} bytes data from ${res.headers.get("Content-Range")}`,
+            fileName
+          );
+          logger.info(
+            `Progress: ${((_next_offset * 100) / _total_size).toFixed(0)}%`,
+            fileName
+          );
+          updateProgress(
+            audioId,
+            fileName,
+            ((_next_offset * 100) / _total_size).toFixed(0)
+          );
+          return res.blob();
         })
         .then((resBlob) => {
           if (_writable !== null) {
-            _writable.write(resBlob).then(() => {});
+            return _writable.write(resBlob);
           } else {
+            if (_next_offset > MAX_BLOB_SIZE) {
+              throw new Error("File too large for in-memory download (" + Math.round(_next_offset / 1024 / 1024) + "MB).");
+            }
             _blobs.push(resBlob);
           }
         })
@@ -400,10 +465,14 @@
             } else {
               save();
             }
+            completeProgress(audioId);
+            cleanup();
           }
         })
         .catch((reason) => {
           logger.error(reason, fileName);
+          AbortProgress(audioId);
+          cleanup();
         });
     };
 
@@ -413,12 +482,10 @@
         fileName
       );
 
-      let blob = new Blob(_blobs, { type: "audio/ogg" });
+      const blob = new Blob(_blobs, { type: _mime_type });
       const blobUrl = window.URL.createObjectURL(blob);
 
       logger.info("Final blob size in bytes: " + blob.size, fileName);
-
-      blob = 0;
 
       const a = document.createElement("a");
       document.body.appendChild(a);
@@ -450,18 +517,22 @@
             .createWritable()
             .then((writable) => {
               fetchNextPart(writable);
+              createProgressBar(audioId, fileName);
             })
             .catch((err) => {
               console.error(err.name, err.message);
+              cleanup();
             });
         })
         .catch((err) => {
           if (err.name !== "AbortError") {
             console.error(err.name, err.message);
           }
+          cleanup();
         });
     } else {
       fetchNextPart(null);
+      createProgressBar(audioId, fileName);
     }
   };
 
@@ -637,48 +708,55 @@
 
   // For webk /k/ webapp
   setInterval(() => {
-    /* Voice Message or Circle Video */
-    const pinnedAudio = document.body.querySelector(".pinned-audio");
-    let dataMid;
-    let downloadButtonPinnedAudio =
-      document.body.querySelector("._tel_download_button_pinned_container") ||
-      document.createElement("button");
-    if (pinnedAudio) {
-      dataMid = pinnedAudio.getAttribute("data-mid");
-      downloadButtonPinnedAudio.className =
-        "btn-icon tgico-download _tel_download_button_pinned_container";
-      downloadButtonPinnedAudio.innerHTML = `<span class="tgico button-icon">${DOWNLOAD_ICON}</span>`;
-    }
+    /* Voice Message or Audio - add download buttons to each audio bubble */
     const audioElements = document.body.querySelectorAll("audio-element");
     audioElements.forEach((audioElement) => {
       const bubble = audioElement.closest(".bubble");
       if (
         !bubble ||
-        bubble.querySelector("._tel_download_button_pinned_container")
+        bubble.querySelector("._tel_download_button")
       ) {
         return; /* Skip if there's already a download button */
       }
-      if (
-        dataMid &&
-        downloadButtonPinnedAudio.getAttribute("data-mid") !== dataMid &&
-        audioElement.getAttribute("data-mid") === dataMid
-      ) {
-        downloadButtonPinnedAudio.onclick = (e) => {
-          e.stopPropagation();
-          if (isAudio) {
-              tel_download_audio(link);
-          } else {
-              tel_download_video(link);
-          }
-        };
-        downloadButtonPinnedAudio.setAttribute("data-mid", dataMid);
-        const link = audioElement.audio && audioElement.audio.getAttribute("src");
-        const isAudio = audioElement.audio && audioElement.audio instanceof HTMLAudioElement
-        if (link) {
-          pinnedAudio
-            .querySelector(".pinned-container-wrapper-utils")
-            .appendChild(downloadButtonPinnedAudio);
+
+      // Get document info from the message metadata
+      const doc = audioElement.message?.media?.document;
+      if (!doc || !doc.dc_id || !doc.id) return;
+
+      // Construct stream URL from document metadata (same format as video)
+      const streamUrl = "stream/" + encodeURIComponent(JSON.stringify({
+        dcId: doc.dc_id,
+        location: {
+          _: "inputDocumentFileLocation",
+          id: doc.id,
+          access_hash: doc.access_hash,
+          file_reference: Array.from(doc.file_reference)
+        },
+        size: doc.size,
+        mimeType: doc.mime_type,
+        fileName: doc.file_name
+      }));
+
+      const isAudio = doc.mime_type?.startsWith("audio/");
+
+      const downloadButton = document.createElement("button");
+      downloadButton.className = "btn-icon tgico-download _tel_download_button";
+      downloadButton.innerHTML = `<span class="tgico button-icon">${DOWNLOAD_ICON}</span>`;
+      downloadButton.setAttribute("type", "button");
+      downloadButton.setAttribute("title", "Download");
+      downloadButton.setAttribute("aria-label", "Download");
+      downloadButton.onclick = (e) => {
+        e.stopPropagation();
+        if (isAudio) {
+          tel_download_audio(streamUrl);
+        } else {
+          tel_download_video(streamUrl);
         }
+      };
+
+      const wrapper = bubble.querySelector(".document-wrapper") || audioElement.parentElement;
+      if (wrapper) {
+        wrapper.appendChild(downloadButton);
       }
     });
 
@@ -785,7 +863,6 @@
       }
     } else if (
       mediaAspecter.querySelector("video") &&
-      mediaAspecter.querySelector("video") &&
       !mediaButtons.querySelector("button.btn-icon.tgico-download")
     ) {
       // 2. Video HTML element detected, could be either GIF or unloaded video
@@ -806,11 +883,10 @@
       mediaButtons.prepend(downloadButton);
     } else if (!mediaButtons.querySelector("button.btn-icon.tgico-download")) {
       // 3. Image without download button detected
-      // container > img.thumbnail
-      if (
-        !mediaAspecter.querySelector("img.thumbnail") ||
-        !mediaAspecter.querySelector("img.thumbnail").src
-      ) {
+      const imgElement = mediaAspecter.querySelector("img.thumbnail") ||
+                         mediaAspecter.querySelector("img.media-photo") ||
+                         mediaAspecter.querySelector("img");
+      if (!onDownload && (!imgElement || !imgElement.src)) {
         return;
       }
       const downloadButton = document.createElement("button");
@@ -823,7 +899,10 @@
         downloadButton.onclick = onDownload;
       } else {
         downloadButton.onclick = () => {
-          tel_download_image(mediaAspecter.querySelector("img.thumbnail").src);
+          const img = mediaAspecter.querySelector("img.thumbnail") ||
+                      mediaAspecter.querySelector("img.media-photo") ||
+                      mediaAspecter.querySelector("img");
+          if (img && img.src) tel_download_image(img.src);
         };
       }
       mediaButtons.prepend(downloadButton);
