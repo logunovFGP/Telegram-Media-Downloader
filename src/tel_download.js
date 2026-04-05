@@ -407,18 +407,28 @@
   };
 
   const tel_download_native = (url, fileName) => {
-    try {
-      logger.info("Native download: " + fileName);
-      const a = document.createElement("a");
-      document.body.appendChild(a);
-      a.href = url;
-      a.download = fileName || "download";
-      a.click();
-      document.body.removeChild(a);
-    } catch (e) {
-      logger.error("Download failed: " + e.message, fileName);
-      showNotification("Download failed: " + e.message, true);
-    }
+    logger.info("Native download: " + fileName);
+    showNotification("Downloading: " + fileName);
+    fetch(url)
+      .then((res) => {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.blob();
+      })
+      .then((blob) => {
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = fileName || "download";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        logger.info("Download triggered", fileName);
+      })
+      .catch((err) => {
+        logger.error("Download failed: " + err.message, fileName);
+        showNotification("Download failed: " + err.message, true);
+      });
   };
 
   logger.info("Initialized");
@@ -445,7 +455,7 @@
     );
   };
 
-  const findDocInBubble = (bubble) => {
+  const findDocInBubble = async (bubble) => {
     // 1. Check all elements for .message.media.document (audio-element, etc.)
     const elements = bubble.querySelectorAll("*");
     for (const el of elements) {
@@ -458,13 +468,10 @@
     const peerId = parseInt(bubble.dataset.peerId);
     if (mid && peerId) {
       const anyAudioEl = document.querySelector("audio-element");
-      if (anyAudioEl?.managers) {
+      if (anyAudioEl?.managers?.appMessagesManager) {
         try {
-          const msg =
-            anyAudioEl.managers.appMessagesManager?.getMessageByPeer?.(
-              peerId,
-              mid
-            );
+          const msg = await anyAudioEl.managers.appMessagesManager
+            .getMessageByPeer(peerId, mid);
           if (msg?.media?.document) return msg.media.document;
         } catch (e) {
           /* internal API unavailable */
@@ -651,6 +658,7 @@
         pinnedAudio.querySelector(".pinned-audio-title")
       )?.textContent?.trim();
       if (pinnedTitle) {
+        // Find matching doc from audio-elements by filename
         let matchedDoc = null;
         const audioEls = document.body.querySelectorAll("audio-element");
         for (const ae of audioEls) {
@@ -660,7 +668,8 @@
             break;
           }
         }
-        if (matchedDoc) {
+        const addPinnedButton = (doc) => {
+          if (pinnedAudio.querySelector("._tel_download_button")) return;
           const downloadBtn = document.createElement("button");
           downloadBtn.className = "btn-icon tgico-download _tel_download_button";
           downloadBtn.innerHTML = `<span class="tgico button-icon">${DOWNLOAD_ICON}</span>`;
@@ -668,10 +677,24 @@
           downloadBtn.setAttribute("title", "Download");
           downloadBtn.onclick = (e) => {
             e.stopPropagation();
-            tel_download_native(buildStreamUrl(matchedDoc), matchedDoc.file_name);
+            tel_download_native(buildStreamUrl(doc), doc.file_name);
           };
           const utils = pinnedAudio.querySelector(".pinned-container-wrapper-utils");
           if (utils) utils.appendChild(downloadBtn);
+        };
+        if (matchedDoc) {
+          addPinnedButton(matchedDoc);
+        } else {
+          // Fallback: find via bubble with matching filename text
+          const bubbles = document.body.querySelectorAll(".bubble.audio-message");
+          for (const b of bubbles) {
+            if (b.textContent.includes(pinnedTitle)) {
+              findDocInBubble(b).then((doc) => {
+                if (doc) addPinnedButton(doc);
+              }).catch(() => {});
+              break;
+            }
+          }
         }
       }
     }
@@ -682,26 +705,32 @@
     );
     bubbles.forEach((bubble) => {
       if (bubble.querySelector("._tel_download_button")) return;
+      // Mark as pending to avoid duplicate async lookups
+      if (bubble.dataset.telDownloadPending) return;
+      bubble.dataset.telDownloadPending = "1";
 
-      const doc = findDocInBubble(bubble);
-      if (!doc || !doc.dc_id || !doc.id) return;
+      findDocInBubble(bubble).then((doc) => {
+        delete bubble.dataset.telDownloadPending;
+        if (!doc || !doc.dc_id || !doc.id) return;
 
-      const isVideo = bubble.classList.contains("video") && !bubble.classList.contains("document-message");
-      if (isVideo) {
-        // Overlay button on the video thumbnail
-        const attachment = bubble.querySelector(".attachment");
-        if (attachment) {
-          attachment.style.position = "relative";
-          attachment.appendChild(createBubbleDownloadButton(doc, true));
+        const isVideo = bubble.classList.contains("video") && !bubble.classList.contains("document-message");
+        if (isVideo) {
+          const attachment = bubble.querySelector(".attachment");
+          if (attachment) {
+            attachment.style.position = "relative";
+            attachment.appendChild(createBubbleDownloadButton(doc, true));
+          }
+        } else {
+          const wrapper =
+            bubble.querySelector(".document-wrapper") ||
+            bubble.querySelector(".bubble-content");
+          if (wrapper) {
+            wrapper.appendChild(createBubbleDownloadButton(doc));
+          }
         }
-      } else {
-        const wrapper =
-          bubble.querySelector(".document-wrapper") ||
-          bubble.querySelector(".bubble-content");
-        if (wrapper) {
-          wrapper.appendChild(createBubbleDownloadButton(doc));
-        }
-      }
+      }).catch(() => {
+        delete bubble.dataset.telDownloadPending;
+      });
     });
 
     // Stories
